@@ -1,16 +1,20 @@
 package queue
 
 import (
-        "context"
-        "crypto/sha256"
-        "encoding/hex"
-        "encoding/json"
-        "log"
-        "errors"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"log"
+	"math"
+	"strconv"
 
-        amqp "github.com/rabbitmq/amqp091-go"
-        "notificationservice/internal/db"
-        "notificationservice/internal/model"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	amqp "github.com/rabbitmq/amqp091-go"
+	"notificationservice/internal/db"
+	"notificationservice/internal/model"
 )
 
 const (
@@ -26,6 +30,21 @@ type Consumer struct {
 	store   *db.Store
 }
 
+var (
+	metricConsumed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "queue_processed_total",
+		Help: "messages successfully processed",
+	})
+	metricRetried = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "queue_retry_total",
+		Help: "messages sent for retry",
+	})
+	metricFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "queue_failed_total",
+		Help: "messages sent to DLQ",
+	})
+)
+
 func NewConsumer(url string, store *db.Store) (*Consumer, error) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
@@ -36,19 +55,19 @@ func NewConsumer(url string, store *db.Store) (*Consumer, error) {
 		conn.Close()
 		return nil, err
 	}
-        c := &Consumer{conn: conn, channel: ch, store: store}
-        if err := c.setup(); err != nil {
-                ch.Close()
-                conn.Close()
-                return nil, err
-        }
-        return c, nil
+	c := &Consumer{conn: conn, channel: ch, store: store}
+	if err := c.setup(); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, err
+	}
+	return c, nil
 }
 
 func (c *Consumer) setup() error {
-        if err := c.channel.ExchangeDeclare(dlx, "direct", true, false, false, false, nil); err != nil {
-                return err
-        }
+	if err := c.channel.ExchangeDeclare(dlx, "direct", true, false, false, false, nil); err != nil {
+		return err
+	}
 	if _, err := c.channel.QueueDeclare(mainQueue, true, false, false, false, amqp.Table{
 		"x-dead-letter-exchange":    dlx,
 		"x-dead-letter-routing-key": retryQueue,
@@ -58,7 +77,6 @@ func (c *Consumer) setup() error {
 	if _, err := c.channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": mainQueue,
-		"x-message-ttl":             int32(10000),
 	}); err != nil {
 		return err
 	}
@@ -68,10 +86,10 @@ func (c *Consumer) setup() error {
 	if err := c.channel.QueueBind(dlqQueue, dlqQueue, dlx, false, nil); err != nil {
 		return err
 	}
-        if err := c.channel.Qos(10, 0, false); err != nil {
-                return err
-        }
-        return nil
+	if err := c.channel.Qos(10, 0, false); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Consumer) Start(ctx context.Context) {
@@ -91,46 +109,57 @@ func (c *Consumer) Start(ctx context.Context) {
 }
 
 func (c *Consumer) Ping() error {
-        if c.conn.IsClosed() {
-                return errors.New("rabbitmq connection closed")
-        }
-        return nil
+	if c.conn.IsClosed() {
+		return errors.New("rabbitmq connection closed")
+	}
+	return nil
 }
 
 func (c *Consumer) handleMessage(m amqp.Delivery) {
-        var in model.NotificationInput
-        if err := json.Unmarshal(m.Body, &in); err != nil {
-                log.Printf("invalid message: %v", err)
-                m.Nack(false, false)
-                return
-        }
-        if err := in.Validate(); err != nil {
-                log.Printf("validation failed: %v", err)
-                m.Ack(false)
-                return
-        }
-        key, _ := m.Headers["Idempotency-Key"].(string)
-        if key == "" {
-                if m.MessageId != "" {
-                        key = m.MessageId
-                } else {
-                        sum := sha256.Sum256(m.Body)
-                        key = hex.EncodeToString(sum[:])
-                }
-        }
-        if err := c.store.CreateNotification(context.Background(), key, in); err != nil {
-                attempts := attemptCount(m)
-                if attempts >= 5 {
-                        // send to DLQ
-                        _ = c.channel.Publish("", dlqQueue, false, false, amqp.Publishing{Body: m.Body, DeliveryMode: amqp.Persistent})
-                        m.Ack(false)
-                        return
-                }
-                m.Nack(false, false)
-                return
-        }
-        log.Printf("stored notification from %s to %s", model.MaskEmail(in.Sender), model.MaskEmail(in.Recipient))
-        m.Ack(false)
+	var in model.NotificationInput
+	if err := json.Unmarshal(m.Body, &in); err != nil {
+		log.Printf("invalid message: %v", err)
+		_ = c.channel.Publish("", dlqQueue, false, false, amqp.Publishing{Body: m.Body, DeliveryMode: amqp.Persistent})
+		metricFailed.Inc()
+		m.Ack(false)
+		return
+	}
+	if err := in.Validate(); err != nil {
+		log.Printf("validation failed: %v", err)
+		m.Ack(false)
+		return
+	}
+	key, _ := m.Headers["Idempotency-Key"].(string)
+	if key == "" {
+		if m.MessageId != "" {
+			key = m.MessageId
+		} else {
+			sum := sha256.Sum256(m.Body)
+			key = hex.EncodeToString(sum[:])
+		}
+	}
+	if err := c.store.CreateNotification(context.Background(), key, in); err != nil {
+		attempts := attemptCount(m)
+		if attempts >= 5 {
+			_ = c.channel.Publish("", dlqQueue, false, false, amqp.Publishing{Body: m.Body, DeliveryMode: amqp.Persistent})
+			metricFailed.Inc()
+			m.Ack(false)
+			return
+		}
+		delay := int(math.Pow(2, float64(attempts))) * 1000
+		_ = c.channel.Publish("", retryQueue, false, false, amqp.Publishing{
+			Body:         m.Body,
+			Headers:      amqp.Table{"Idempotency-Key": key},
+			DeliveryMode: amqp.Persistent,
+			Expiration:   strconv.Itoa(delay),
+		})
+		metricRetried.Inc()
+		m.Ack(false)
+		return
+	}
+	metricConsumed.Inc()
+	log.Printf("stored notification from %s to %s", model.MaskEmail(in.Sender), model.MaskEmail(in.Recipient))
+	m.Ack(false)
 }
 
 func attemptCount(m amqp.Delivery) int {

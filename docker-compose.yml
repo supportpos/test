@@ -29,6 +29,8 @@ services:
       DATABASE_URL: postgres://postgres:postgres@db:5432/postgres?sslmode=disable
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       rabbitmq:
@@ -42,9 +44,27 @@ services:
       DATABASE_URL: postgres://postgres:postgres@db:5432/postgres?sslmode=disable
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  migrate:
+    build: .
+    command: ["./migrate"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/postgres?sslmode=disable
+    depends_on:
+      db:
         condition: service_healthy
 volumes:
   db-data:
